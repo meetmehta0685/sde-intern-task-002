@@ -155,3 +155,56 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+1. **Paying a share is one conditional `UPDATE`, not a read followed by a write.**
+   `UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL RETURNING …`
+   D1 (SQLite) runs write statements one at a time, so when two requests race, only the first one
+   finds `paid_at IS NULL` and changes the row. If nothing changed, I read the share once: a missing
+   row is a `404`, the same key gives back the stored result (`200`, same `paidAt`), and any other key
+   gets a `409`. The key is stored on the share itself, and the `shares_paid_has_key` CHECK makes
+   sure a paid share always records the key that paid it. Trade-off: keys are scoped per share, not
+   globally, which is all the spec asks for and keeps the model simple.
+
+2. **Member order is an explicit `position` column, computed inside the `INSERT`.**
+   The split gives the extra cents to members in the order they joined, so that order is data, not an
+   accident of `rowid` or timestamps (two members can join in the same millisecond). The next position
+   is calculated in the same SQL statement that inserts the member, and `UNIQUE (home_id, position)`
+   backs it up. The split itself is a small pure function (`api/src/split.ts`) with no database access:
+   `base = floor(total / n)`, and the first `total % n` members get one extra cent.
+
+3. **Money is whole cents end to end, and strict validation.**
+   The API accepts only a JSON number that is a positive safe integer; `"1000"`, `10.5`, `0` and
+   numbers above `Number.MAX_SAFE_INTEGER` are rejected with `422` instead of being converted. The
+   database repeats the rule (`CHECK (typeof(total_cents) = 'integer' AND total_cents > 0)`). On the
+   web page the user types dollars, and `parseDollarsToCents` turns `"12.34"` into `1234` with string
+   parsing, never float maths. A bill and its shares are written in one `db.batch()` transaction, so a
+   bill can never exist without its shares.
+
+### Named constraints
+
+| Constraint                                  | What it stops                                                     |
+| ------------------------------------------- | ----------------------------------------------------------------- |
+| `members_home_fk`, `bills_home_fk`          | Members or bills that point at a home that does not exist         |
+| `shares_bill_fk`, `shares_member_fk`        | Shares for a bill or member that does not exist                   |
+| `members_home_position_unique`              | Two members in one home with the same position (ambiguous order)  |
+| `shares_bill_member_unique`                 | The same member getting two shares of one bill                    |
+| `bills_total_positive_integer`              | A total that is zero, negative, or not an integer                 |
+| `shares_amount_non_negative_integer`        | Negative or fractional share amounts                              |
+| `shares_paid_has_key`                       | A paid share with no idempotency key, or a key on an unpaid share |
+| `*_name_not_blank`, `bills_title_not_blank` | Empty or whitespace-only names and titles                         |
+
+### Extra endpoints used by the web page
+
+- `GET /api/homes/:homeId`: the home and its members, in join order
+- `GET /api/homes/:homeId/bills`: the home's bills (newest first), each with its shares
+
+### Web page behaviour
+
+- Every request has a 10 second timeout. Network errors, timeouts, 5xx responses, and bodies that
+  are not JSON all become a readable error message, so the page never crashes.
+- Loading, empty ("No bills yet"), and error (with "Try again") states. After the first load, a
+  failed refresh keeps the data on screen and shows a banner.
+- A failed payment keeps the share unpaid and shows the error under it. "Retry" reuses the same
+  `Idempotency-Key`, so if the first request actually reached the server, it cannot pay twice.
